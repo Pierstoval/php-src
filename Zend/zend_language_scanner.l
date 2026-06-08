@@ -598,6 +598,7 @@ static zend_op_array *zend_compile(zend_function_type type)
 	CG(in_compilation) = 1;
 	CG(ast) = NULL;
 	CG(ast_arena) = zend_arena_create(1024 * 32);
+	CG(has_close_tag) = 0;
 
 	if (!zendparse()) {
 		uint32_t last_lineno = CG(zend_lineno);
@@ -619,6 +620,10 @@ static zend_op_array *zend_compile(zend_function_type type)
 		zend_file_context_begin(&original_file_context);
 		zend_oparray_context_begin(&original_oparray_context, op_array);
 		zend_compile_top_stmt(CG(ast));
+		if (CG(file_context).declarables.def && CG(has_close_tag)) {
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Closing tag \"?>\" is not allowed in definitions files");
+		}
 		CG(zend_lineno) = last_lineno;
 		zend_emit_final_return(type == ZEND_USER_FUNCTION);
 		op_array->line_start = 1;
@@ -2527,6 +2532,10 @@ inline_char_handler:
 	if (yytext[yyleng-1] != '>') {
 		CG(increment_lineno) = 1;
 	}
+	/* Track the presence of a closing tag so definitions files (declare(def=1))
+	 * can reject it after compilation. In parser mode the token is reported as
+	 * an implicit ';', so the flag must be set in both modes here. */
+	CG(has_close_tag) = 1;
 	if (PARSER_MODE()) {
 		RETURN_TOKEN(';');  /* implicit ';' at php-end tag */
 	}

@@ -407,6 +407,7 @@ void zend_file_context_begin(zend_file_context *prev_context) /* {{{ */
 	FC(in_namespace) = 0;
 	FC(has_bracketed_namespaces) = 0;
 	FC(declarables).ticks = 0;
+	FC(declarables).def = 0;
 	zend_hash_init(&FC(seen_symbols), 8, NULL, NULL, 0);
 }
 /* }}} */
@@ -431,6 +432,10 @@ void zend_init_compiler_data_structures(void) /* {{{ */
 	CG(encoding_declared) = 0;
 	CG(memoized_exprs) = NULL;
 	CG(memoize_mode) = ZEND_MEMOIZE_NONE;
+
+	CG(has_close_tag) = 0;
+	CG(current_scope_depth) = 0;
+	CG(def_switch_depth) = 0;
 }
 /* }}} */
 
@@ -6687,7 +6692,9 @@ static void zend_compile_switch(zend_ast *ast) /* {{{ */
 			}
 		}
 
+		CG(def_switch_depth)++;
 		zend_compile_stmt(stmt_ast);
+		CG(def_switch_depth)--;
 	}
 
 	if (!has_default_case) {
@@ -7310,6 +7317,29 @@ static void zend_compile_declare(const zend_ast *ast) /* {{{ */
 
 			if (Z_LVAL(value_zv) == 1) {
 				CG(active_op_array)->fn_flags |= ZEND_ACC_STRICT_TYPES;
+			}
+
+		} else if (zend_string_equals_literal_ci(name, "def")) {
+			zval value_zv;
+
+			if (FAILURE == zend_is_first_statement(ast, /* allow_nop */ true)) {
+				zend_error_noreturn(E_COMPILE_ERROR, "def declaration must be "
+					"the very first statement in the script");
+			}
+
+			if (ast->child[1] != NULL) {
+				zend_error_noreturn(E_COMPILE_ERROR, "def declaration must not "
+					"use block mode");
+			}
+
+			zend_const_expr_to_zval(&value_zv, value_ast_ptr, /* allow_dynamic */ false);
+
+			if (Z_TYPE(value_zv) != IS_LONG || (Z_LVAL(value_zv) != 0 && Z_LVAL(value_zv) != 1)) {
+				zend_error_noreturn(E_COMPILE_ERROR, "def declaration must have 0 or 1 as its value");
+			}
+
+			if (Z_LVAL(value_zv) == 1) {
+				FC(declarables).def = 1;
 			}
 
 		} else {
@@ -8896,7 +8926,11 @@ static zend_op_array *zend_compile_func_decl_ex(
 		}
 	}
 
+	/* The body of a function/method/closure/arrow-function is exempt from the
+	 * definitions-file global-scope restrictions. */
+	CG(current_scope_depth)++;
 	zend_compile_stmt(stmt_ast);
+	CG(current_scope_depth)--;
 
 	if (is_method) {
 		CG(zend_lineno) = decl->start_lineno;
@@ -9652,7 +9686,11 @@ static void zend_compile_class_decl(znode *result, const zend_ast *ast, bool top
 		zend_enum_register_props(ce);
 	}
 
+	/* A class body opens a non-global scope: its members and method bodies are
+	 * not subject to the definitions-file global-scope restrictions. */
+	CG(current_scope_depth)++;
 	zend_compile_stmt(stmt_ast);
+	CG(current_scope_depth)--;
 
 	/* Reset lineno for final opcodes and errors */
 	CG(zend_lineno) = ast->lineno;
@@ -11971,6 +12009,340 @@ void zend_const_expr_to_zval(zval *result, zend_ast **ast_ptr, bool allow_dynami
 }
 /* }}} */
 
+/* Definitions files (declare(def=1)) enforce a set of structural constraints on
+ * the file global / namespace scope. The rules only apply while we are not inside
+ * a function/method/closure body (CG(current_scope_depth) == 0). */
+static zend_always_inline bool zend_def_is_active(void)
+{
+	return FC(declarables).def && CG(current_scope_depth) == 0;
+}
+
+static bool zend_def_break_level_is_one(const zend_ast *ast) /* {{{ */
+{
+	zend_ast *depth_ast = ast->child[0];
+
+	if (!depth_ast) {
+		return true;
+	}
+	if (depth_ast->kind != ZEND_AST_ZVAL) {
+		return false;
+	}
+
+	const zval *depth_zv = zend_ast_get_zval(depth_ast);
+	return Z_TYPE_P(depth_zv) == IS_LONG && Z_LVAL_P(depth_zv) == 1;
+}
+/* }}} */
+
+/* Validate that a ZEND_AST_CONST node refers to an engine/extension constant
+ * (or true/false/null), not a user-defined or undefined constant. */
+static void zend_def_validate_const(zend_ast *ast) /* {{{ */
+{
+	zend_ast *name_ast = ast->child[0];
+	zend_string *orig_name = zend_ast_get_str(name_ast);
+	bool is_fully_qualified;
+	zend_string *resolved_name =
+		zend_resolve_const_name(orig_name, name_ast->attr, &is_fully_qualified);
+
+	const char *lookup_name = ZSTR_VAL(resolved_name);
+	size_t lookup_len = ZSTR_LEN(resolved_name);
+	if (!is_fully_qualified) {
+		zend_get_unqualified_name(resolved_name, &lookup_name, &lookup_len);
+	}
+
+	bool is_special = zend_get_special_const(lookup_name, lookup_len) != NULL;
+	const zend_constant *c = NULL;
+	if (!is_special) {
+		c = zend_hash_find_ptr(EG(zend_constants), resolved_name);
+		if (!c && !is_fully_qualified && FC(current_namespace)) {
+			/* Unqualified names fall back to the global constant. */
+			c = zend_hash_str_find_ptr(EG(zend_constants), lookup_name, lookup_len);
+		}
+	}
+
+	bool is_defined = is_special || c != NULL;
+	bool is_user = c != NULL && ZEND_CONSTANT_MODULE_NUMBER(c) == PHP_USER_CONSTANT;
+
+	zend_string_release_ex(resolved_name, 0);
+
+	if (!is_defined) {
+		zend_error_noreturn(E_COMPILE_ERROR,
+			"Use of undefined constant \"%s\" is not allowed in definitions file global scope",
+			ZSTR_VAL(orig_name));
+	}
+	if (is_user) {
+		zend_error_noreturn(E_COMPILE_ERROR,
+			"User-defined constant \"%s\" is not allowed in definitions file global scope",
+			ZSTR_VAL(orig_name));
+	}
+}
+/* }}} */
+
+/* Validate that an expression only uses constructs that are deterministic at
+ * compile time: literals, magic constants, engine constants and allowed operators.
+ * Used for if/loop conditions, return values, const declarations and include
+ * paths in definitions files. */
+static void zend_def_validate_expr(zend_ast *ast) /* {{{ */
+{
+	if (ast == NULL) {
+		return;
+	}
+
+	switch (ast->kind) {
+		case ZEND_AST_ZVAL:
+		case ZEND_AST_MAGIC_CONST:
+			return;
+		case ZEND_AST_CONST:
+			zend_def_validate_const(ast);
+			return;
+
+		case ZEND_AST_VAR:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Variables are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_PROP:
+		case ZEND_AST_NULLSAFE_PROP:
+		case ZEND_AST_STATIC_PROP:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Property accesses are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_CALL:
+		case ZEND_AST_METHOD_CALL:
+		case ZEND_AST_NULLSAFE_METHOD_CALL:
+		case ZEND_AST_STATIC_CALL:
+		case ZEND_AST_PIPE:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Function calls are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_NEW:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Object instantiation is not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_ISSET:
+		case ZEND_AST_EMPTY:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"isset()/empty() are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_ASSIGN:
+		case ZEND_AST_ASSIGN_REF:
+		case ZEND_AST_ASSIGN_OP:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Assignments are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_CLOSURE:
+		case ZEND_AST_ARROW_FUNC:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Closures are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_RETURN:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Return statements are not allowed in definitions file global scope");
+			return;
+
+		/* Operators and structural expression nodes that are allowed as long as
+		 * all of their operands are themselves allowed. */
+		case ZEND_AST_BINARY_OP:
+		case ZEND_AST_GREATER:
+		case ZEND_AST_GREATER_EQUAL:
+		case ZEND_AST_AND:
+		case ZEND_AST_OR:
+		case ZEND_AST_UNARY_OP:
+		case ZEND_AST_UNARY_PLUS:
+		case ZEND_AST_UNARY_MINUS:
+		case ZEND_AST_CAST:
+		case ZEND_AST_CONDITIONAL:
+		case ZEND_AST_COALESCE:
+		case ZEND_AST_DIM:
+		case ZEND_AST_ARRAY:
+		case ZEND_AST_ARRAY_ELEM:
+		case ZEND_AST_UNPACK:
+		case ZEND_AST_CLASS_CONST:
+		case ZEND_AST_CLASS_NAME:
+		case ZEND_AST_CONST_ENUM_INIT:
+		case ZEND_AST_NAMED_ARG:
+		case ZEND_AST_MATCH:
+		case ZEND_AST_MATCH_ARM:
+		case ZEND_AST_MATCH_ARM_LIST:
+		case ZEND_AST_EXPR_LIST:
+			break;
+
+		default:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Expression is not allowed in definitions file global scope");
+			return;
+	}
+
+	if (zend_ast_is_list(ast)) {
+		const zend_ast_list *list = zend_ast_get_list(ast);
+		for (uint32_t i = 0; i < list->children; ++i) {
+			zend_def_validate_expr(list->child[i]);
+		}
+	} else {
+		uint32_t children = zend_ast_get_num_children(ast);
+		for (uint32_t i = 0; i < children; ++i) {
+			zend_def_validate_expr(ast->child[i]);
+		}
+	}
+}
+/* }}} */
+
+/* Validate a single statement node against the definitions-file rules. Nested
+ * statements (loop/if bodies, etc.) are validated by the recursive
+ * zend_compile_stmt() calls, so only the current node and the expressions it
+ * directly owns (conditions, values, ...) are checked here. */
+static void zend_def_validate_stmt(zend_ast *ast) /* {{{ */
+{
+	if (ast == NULL) {
+		return;
+	}
+
+	switch (ast->kind) {
+		/* Structurally allowed statements. */
+		case ZEND_AST_STMT_LIST:
+		case ZEND_AST_FUNC_DECL:
+		case ZEND_AST_CLASS:
+		case ZEND_AST_NAMESPACE:
+		case ZEND_AST_USE:
+		case ZEND_AST_GROUP_USE:
+		case ZEND_AST_DECLARE:
+			return;
+
+		case ZEND_AST_CONST_DECL: {
+			const zend_ast_list *list = zend_ast_get_list(ast);
+			for (uint32_t i = 0; i < list->children; ++i) {
+				const zend_ast *const_ast = list->child[i];
+				if (const_ast->kind == ZEND_AST_CONST_ELEM) {
+					zend_def_validate_expr(const_ast->child[1]);
+				}
+			}
+			return;
+		}
+
+		case ZEND_AST_RETURN:
+			zend_def_validate_expr(ast->child[0]);
+			return;
+
+		case ZEND_AST_IF: {
+			const zend_ast_list *list = zend_ast_get_list(ast);
+			for (uint32_t i = 0; i < list->children; ++i) {
+				const zend_ast *elem = list->child[i];
+				zend_def_validate_expr(elem->child[0]);
+			}
+			return;
+		}
+
+		case ZEND_AST_SWITCH: {
+			zend_def_validate_expr(ast->child[0]);
+			const zend_ast_list *cases = zend_ast_get_list(ast->child[1]);
+			for (uint32_t i = 0; i < cases->children; ++i) {
+				zend_def_validate_expr(cases->child[i]->child[0]);
+			}
+			return;
+		}
+
+		case ZEND_AST_WHILE:
+			zend_def_validate_expr(ast->child[0]);
+			return;
+		case ZEND_AST_DO_WHILE:
+			zend_def_validate_expr(ast->child[1]);
+			return;
+		case ZEND_AST_FOR:
+			zend_def_validate_expr(ast->child[0]);
+			zend_def_validate_expr(ast->child[1]);
+			zend_def_validate_expr(ast->child[2]);
+			return;
+		case ZEND_AST_FOREACH:
+			zend_def_validate_expr(ast->child[0]);
+			return;
+
+		/* Expression statements: only include/require are allowed, and the path
+		 * must itself be an allowed expression. A bare match() statement is allowed
+		 * as long as all of its parts are allowed. */
+		case ZEND_AST_INCLUDE_OR_EVAL:
+			if (ast->attr == ZEND_EVAL) {
+				zend_error_noreturn(E_COMPILE_ERROR,
+					"eval() is not allowed in definitions file global scope");
+			}
+			zend_def_validate_expr(ast->child[0]);
+			return;
+		case ZEND_AST_MATCH:
+			zend_def_validate_expr(ast);
+			return;
+
+		/* Explicitly forbidden statements with tailored diagnostics. */
+		case ZEND_AST_ECHO:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"echo is not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_THROW:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"throw is not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_UNSET:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"unset() is not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_GLOBAL:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"global declarations are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_STATIC:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"static variables are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_TRY:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"try/catch/finally is not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_BREAK:
+			if (CG(def_switch_depth) > 0) {
+				if (!zend_def_break_level_is_one(ast)) {
+					zend_error_noreturn(E_COMPILE_ERROR,
+						"break with a level greater than 1 is not allowed in definitions file global scope");
+				}
+				return;
+			}
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"break is not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_CONTINUE:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"continue is not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_GOTO:
+		case ZEND_AST_LABEL:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"goto and labels are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_HALT_COMPILER:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"__halt_compiler() is not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_ASSIGN:
+		case ZEND_AST_ASSIGN_REF:
+		case ZEND_AST_ASSIGN_OP:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Assignments are not allowed in definitions file global scope");
+			return;
+		case ZEND_AST_CALL:
+		case ZEND_AST_METHOD_CALL:
+		case ZEND_AST_NULLSAFE_METHOD_CALL:
+		case ZEND_AST_STATIC_CALL:
+		case ZEND_AST_PIPE:
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Call statements are not allowed in definitions file global scope");
+			return;
+
+		default:
+			/* Any other expression statement (new, variable, etc.) is rejected.
+			 * Reusing the expression validator yields a precise message. */
+			zend_def_validate_expr(ast);
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Expression statements are not allowed in definitions file global scope");
+			return;
+	}
+}
+/* }}} */
+
 /* Same as compile_stmt, but with early binding */
 void zend_compile_top_stmt(zend_ast *ast) /* {{{ */
 {
@@ -12011,6 +12383,10 @@ static void zend_compile_stmt(zend_ast *ast) /* {{{ */
 	}
 
 	CG(zend_lineno) = ast->lineno;
+
+	if (zend_def_is_active()) {
+		zend_def_validate_stmt(ast);
+	}
 
 	if ((CG(compiler_options) & ZEND_COMPILE_EXTENDED_STMT) && !zend_is_unticked_stmt(ast)) {
 		zend_do_extended_stmt(NULL);

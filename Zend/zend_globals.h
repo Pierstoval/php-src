@@ -141,6 +141,16 @@ struct _zend_compiler_globals {
 	bool detect_unicode;
 	bool encoding_declared;
 
+	/* Set by the lexer when it encounters a closing tag '?>'. Used to enforce
+	 * the "no closing tag" rule of definitions files (declare(def=1)). */
+	bool has_close_tag;
+	/* Depth of nested scopes currently being compiled (e.g. function/method/
+	 * closure/arrow-function/class bodies). File-level rules apply when 0. */
+	uint32_t current_scope_depth;
+	/* Depth of switch statements currently being compiled. Used to allow
+	 * break/break 1 inside switch bodies in definitions files. */
+	uint32_t def_switch_depth;
+
 	zend_ast *ast;
 	zend_arena *ast_arena;
 
